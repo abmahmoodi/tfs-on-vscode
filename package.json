@@ -1,0 +1,111 @@
+{
+    "name": "tfs-checkout",
+    "displayName": "TFS Checkout",
+    "description": "Adds TFS checkout commands, auto-checkout on first edit (.cs/.resx), build solution command, and TFS changes view with colorized output",
+    "version": "1.4.0",
+    "publisher": "alborz-team",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/abmahmoodi/tfs-on-vscode.git"
+    },
+    "keywords": [
+        "tfs",
+        "tfvc",
+        "checkout",
+        "version control",
+        "team foundation server",
+        "diff",
+        "changes"
+    ],
+    "engines": {
+        "vscode": "^1.60.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "activationEvents": [
+        "*"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "tfsCheckout.checkoutCurrentFile",
+                "title": "TFS: Checkout This File"
+            },
+            {
+                "command": "tfsCheckout.checkoutAllOpenFiles",
+                "title": "TFS: Checkout All Open Files"
+            },
+            {
+                "command": "tfsCheckout.buildSolution",
+                "title": "TFS: Build .NET Solution"
+            },
+            {
+                "command": "tfsCheckout.showPendingChanges",
+                "title": "TFS: Show Pending Changes"
+            },
+            {
+                "command": "tfsCheckout.showFileStatus",
+                "title": "TFS: Show File Status"
+            },
+            {
+                "command": "tfsCheckout.showChangeDetails",
+                "title": "TFS: Show Change Details"
+            },
+            {
+                "command": "tfsCheckout.undoChanges",
+                "title": "TFS: Undo Changes"
+            }
+        ],
+        "menus": {
+            "editor/context": [
+                {
+                    "command": "tfsCheckout.checkoutCurrentFile",
+                    "group": "1_modification@1",
+                    "when": "editorTextFocus"
+                }
+            ],
+            "explorer/context": [
+                {
+                    "command": "tfsCheckout.checkoutCurrentFile",
+                    "group": "1_modification@1",
+                    "when": "resourceScheme == file"
+                },
+                {
+                    "command": "tfsCheckout.showFileStatus",
+                    "group": "2_workspace@1",
+                    "when": "resourceScheme == file"
+                },
+                {
+                    "command": "tfsCheckout.undoChanges",
+                    "group": "1_modification@2",
+                    "when": "resourceScheme == file"
+                }
+            ]
+        },
+        "keybindings": [
+            {
+                "command": "tfsCheckout.checkoutCurrentFile",
+                "key": "ctrl+alt+o",
+                "when": "editorTextFocus"
+            },
+            {
+                "command": "tfsCheckout.checkoutAllOpenFiles",
+                "key": "ctrl+shift+alt+o"
+            },
+            {
+                "command": "tfsCheckout.buildSolution",
+                "key": "ctrl+alt+shift+b"
+            },
+            {
+                "command": "tfsCheckout.showPendingChanges",
+                "key": "ctrl+alt+p"
+            },
+            {
+                "command": "tfsCheckout.showFileStatus",
+                "key": "ctrl+alt+s"
+            }
+        ]
+    }
+}
