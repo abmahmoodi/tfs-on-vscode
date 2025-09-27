@@ -4,10 +4,184 @@ const path = require('path');
 const fs = require('fs');
 
 /**
+ * TFS Pending Changes Tree Data Provider
+ */
+class TfsPendingChangesProvider {
+    constructor() {
+        this._onDidChangeTreeData = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+        this.pendingFiles = [];
+    }
+
+    refresh() {
+        this._loadPendingChanges();
+    }
+
+    getTreeItem(element) {
+        const treeItem = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
+        treeItem.tooltip = element.tooltip;
+        treeItem.description = element.description;
+        treeItem.contextValue = 'pendingFile';
+        treeItem.iconPath = new vscode.ThemeIcon(element.icon);
+        treeItem.command = {
+            command: 'tfsCheckout.openFileChange',
+            title: 'Open Change',
+            arguments: [element.filePath]
+        };
+        return treeItem;
+    }
+
+    getChildren(element) {
+        if (!element) {
+            return Promise.resolve(this.pendingFiles);
+        }
+        return Promise.resolve([]);
+    }
+
+    async _loadPendingChanges() {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            this.pendingFiles = [];
+            this._onDidChangeTreeData.fire();
+            return;
+        }
+
+        return new Promise((resolve) => {
+            const command = 'tf status /recursive /format:detailed';
+            const rootPath = workspaceFolder.uri.fsPath;
+
+            exec(command, { cwd: rootPath }, (error, stdout, stderr) => {
+                this.pendingFiles = [];
+
+                if (error) {
+                    if (!stderr.includes('No pending changes') && !stdout.includes('No pending changes')) {
+                        console.error('TFS Status error:', error.message);
+                    }
+                    this._onDidChangeTreeData.fire();
+                    resolve();
+                    return;
+                }
+
+                // Parse the output to extract files
+                const lines = stdout.split('\n').filter(line => line.trim());
+
+                // Parse detailed format output
+                let currentFile = null;
+                let currentChange = null;
+
+                for (const line of lines) {
+                    const trimmedLine = line.trim();
+
+                    // Check if this is a file path line (starts with $/ or full path)
+                    if (trimmedLine.startsWith('$/') || trimmedLine.match(/^[A-Z]:\\/)) {
+                        // Extract file path (remove changeset info if present)
+                        currentFile = trimmedLine.split(';')[0];
+                        currentChange = null; // Reset change type
+                    }
+                    // Check if this is a change type line
+                    else if (trimmedLine.startsWith('Change     :')) {
+                        currentChange = trimmedLine.replace('Change     :', '').trim();
+                    }
+                    // Check if this is a local item line (contains the actual local path)
+                    else if (trimmedLine.startsWith('Local item :') && currentFile && currentChange) {
+                        // Extract the local path
+                        const localPathMatch = trimmedLine.match(/Local item\s*:\s*(?:\[.*?\]\s*)?(.+)$/);
+                        if (localPathMatch) {
+                            const localPath = localPathMatch[1].trim();
+                            const fileName = path.basename(localPath);
+                            const relativePath = path.relative(rootPath, localPath);
+
+                            // Determine icon based on change type
+                            let iconName = '';
+                            let changeType = currentChange.toUpperCase();
+
+                            switch (changeType) {
+                                case 'EDIT':
+                                    iconName = 'edit';
+                                    break;
+                                case 'ADD':
+                                    iconName = 'add';
+                                    break;
+                                case 'DELETE':
+                                    iconName = 'trash';
+                                    break;
+                                case 'RENAME':
+                                    iconName = 'arrow-right';
+                                    break;
+                                default:
+                                    iconName = 'file';
+                                    break;
+                            }
+
+                            this.pendingFiles.push({
+                                label: fileName,
+                                description: relativePath,
+                                tooltip: `${changeType}: ${localPath}`,
+                                filePath: localPath,
+                                changeType: changeType,
+                                icon: iconName
+                            });
+                        }
+                    }
+                }
+
+                this._onDidChangeTreeData.fire();
+                resolve();
+            });
+        });
+    }
+}
+
+/**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
     console.log('TFS Checkout extension is now active!');
+
+    // Create and register TFS Pending Changes tree data provider
+    const tfsPendingChangesProvider = new TfsPendingChangesProvider();
+    vscode.window.registerTreeDataProvider('tfsPendingChanges', tfsPendingChangesProvider);
+
+    // Register command for refreshing pending changes
+    let refreshPendingChanges = vscode.commands.registerCommand('tfsCheckout.refreshPendingChanges', () => {
+        tfsPendingChangesProvider.refresh();
+    });
+    context.subscriptions.push(refreshPendingChanges);
+
+    // Register command for opening file changes
+    let openFileChange = vscode.commands.registerCommand('tfsCheckout.openFileChange', async (filePathOrItem) => {
+        let filePath;
+        if (typeof filePathOrItem === 'string') {
+            filePath = filePathOrItem;
+        } else if (filePathOrItem && filePathOrItem.filePath) {
+            filePath = filePathOrItem.filePath;
+        }
+
+        if (filePath) {
+            await showTfsChangeDetails(filePath);
+        }
+    });
+    context.subscriptions.push(openFileChange);
+
+    // Register command for undoing file changes from tree view
+    let undoFileChange = vscode.commands.registerCommand('tfsCheckout.undoFileChange', async (filePathOrItem) => {
+        let filePath;
+        if (typeof filePathOrItem === 'string') {
+            filePath = filePathOrItem;
+        } else if (filePathOrItem && filePathOrItem.filePath) {
+            filePath = filePathOrItem.filePath;
+        }
+
+        if (filePath) {
+            await undoTfsChanges(filePath);
+            // Refresh the tree view after undoing changes
+            tfsPendingChangesProvider.refresh();
+        }
+    });
+    context.subscriptions.push(undoFileChange);
+
+    // Load pending changes initially
+    tfsPendingChangesProvider.refresh();
 
     // Register command for checking out current file
     let checkoutCurrentFile = vscode.commands.registerCommand('tfsCheckout.checkoutCurrentFile', async () => {
@@ -85,6 +259,33 @@ function activate(context) {
         await undoTfsChanges(activeEditor.document.fileName);
     });
     context.subscriptions.push(undoChanges);
+
+    // Register command for getting latest version of current file
+    let getLatestCurrentFile = vscode.commands.registerCommand('tfsCheckout.getLatestCurrentFile', async () => {
+        const activeEditor = vscode.window.activeTextEditor;
+        if (!activeEditor) {
+            vscode.window.showWarningMessage('No active file to get latest');
+            return;
+        }
+        await getLatestFileWithProgress(activeEditor.document.fileName);
+    });
+    context.subscriptions.push(getLatestCurrentFile);
+
+    // Register command for showing diff from pending changes
+    let showDiffFromPendingChanges = vscode.commands.registerCommand('tfsCheckout.showDiffFromPendingChanges', async (filePath) => {
+        if (filePath && typeof filePath === 'string') {
+            await showTfsChangeDetails(filePath);
+        } else {
+            vscode.window.showWarningMessage('No file path provided for diff');
+        }
+    });
+    context.subscriptions.push(showDiffFromPendingChanges);
+
+    // Register command for interactive pending changes with actions
+    let showPendingChangesWithActions = vscode.commands.registerCommand('tfsCheckout.showPendingChangesWithActions', async () => {
+        await showInteractivePendingChanges();
+    });
+    context.subscriptions.push(showPendingChangesWithActions);
 
     // Auto checkout on first user edit for C# (.cs) or resource (.resx) files
     const autoCheckedOut = new Set();
@@ -168,32 +369,114 @@ async function buildDotnetSolution() {
     }
 }
 
-async function checkoutFile(filePath) {
-    return new Promise((resolve) => {
-        const command = `tf checkout "${filePath}"`;
+async function getLatestFile(filePath) {
+    return new Promise((resolve, reject) => {
+        const command = `tf get "${filePath}" /recursive`;
 
+        exec(command, (error, stdout, stderr) => {
+            if (error) {
+                // Check if it's just "up to date" message
+                if (stderr.includes('up to date') || stdout.includes('up to date') ||
+                    stderr.includes('All files are up to date') || stdout.includes('All files are up to date')) {
+                    resolve({ success: true, message: 'File is already up to date', isUpToDate: true });
+                } else {
+                    reject(new Error(`TFS Get Latest failed: ${error.message}`));
+                }
+            } else {
+                // Check if file was actually updated
+                const isUpdated = stdout.includes('Getting') || stdout.includes('Replacing');
+                resolve({
+                    success: true,
+                    message: isUpdated ? 'File updated to latest version' : 'File is already up to date',
+                    isUpToDate: !isUpdated
+                });
+            }
+        });
+    });
+}
+
+async function getLatestFileWithProgress(filePath) {
+    return new Promise(async (resolve) => {
         vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
-            title: "TFS Checkout",
+            title: "TFS Get Latest",
             cancellable: false
-        }, (progress) => {
-            progress.report({ message: `Checking out: ${path.basename(filePath)}` });
+        }, async (progress) => {
+            try {
+                progress.report({ message: `Getting latest: ${path.basename(filePath)}` });
 
-            return new Promise((progressResolve) => {
-                exec(command, (error, stdout, stderr) => {
-                    if (error) {
-                        if (stderr.includes('already checked out') || stdout.includes('already checked out')) {
-                            vscode.window.showInformationMessage(`File already checked out: ${path.basename(filePath)}`);
-                        } else {
-                            vscode.window.showErrorMessage(`TFS Checkout failed: ${error.message}`);
-                        }
-                    } else {
-                        vscode.window.showInformationMessage(`Successfully checked out: ${path.basename(filePath)}`);
+                const result = await getLatestFile(filePath);
+
+                // If file was updated, reload it in editor if it's currently open
+                if (!result.isUpToDate) {
+                    const activeEditor = vscode.window.activeTextEditor;
+                    if (activeEditor && activeEditor.document.fileName === filePath) {
+                        await vscode.commands.executeCommand('workbench.action.files.revert');
                     }
-                    progressResolve();
-                    resolve();
+                }
+
+                vscode.window.showInformationMessage(
+                    `${result.message}: ${path.basename(filePath)}`
+                );
+
+                resolve();
+            } catch (error) {
+                vscode.window.showErrorMessage(`TFS Get Latest failed: ${error.message}`);
+                resolve();
+            }
+        });
+    });
+}
+
+async function checkoutFile(filePath) {
+    return new Promise(async (resolve) => {
+        vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "TFS Get Latest & Checkout",
+            cancellable: false
+        }, async (progress) => {
+            try {
+                // Step 1: Get latest version first
+                progress.report({ message: `Getting latest: ${path.basename(filePath)}` });
+
+                const getLatestResult = await getLatestFile(filePath);
+
+                // If file was updated, reload it in editor if it's currently open
+                if (!getLatestResult.isUpToDate) {
+                    const activeEditor = vscode.window.activeTextEditor;
+                    if (activeEditor && activeEditor.document.fileName === filePath) {
+                        await vscode.commands.executeCommand('workbench.action.files.revert');
+                    }
+                }
+
+                // Step 2: Now checkout the file
+                progress.report({ message: `Checking out: ${path.basename(filePath)}` });
+
+                const command = `tf checkout "${filePath}"`;
+
+                return new Promise((progressResolve) => {
+                    exec(command, (error, stdout, stderr) => {
+                        if (error) {
+                            if (stderr.includes('already checked out') || stdout.includes('already checked out')) {
+                                vscode.window.showInformationMessage(
+                                    `${getLatestResult.message}. File already checked out: ${path.basename(filePath)}`
+                                );
+                            } else {
+                                vscode.window.showErrorMessage(`TFS Checkout failed: ${error.message}`);
+                            }
+                        } else {
+                            vscode.window.showInformationMessage(
+                                `${getLatestResult.message}. Successfully checked out: ${path.basename(filePath)}`
+                            );
+                        }
+                        progressResolve();
+                        resolve();
+                    });
                 });
-            });
+            } catch (error) {
+                vscode.window.showErrorMessage(`TFS operation failed: ${error.message}`);
+                resolve();
+            }
         });
     });
 }
@@ -273,39 +556,220 @@ async function showTfsPendingChanges() {
                         outputChannel.appendLine('========================');
                         outputChannel.appendLine('');
 
-                        // Parse and colorize the status output
+                        // Parse and display the status output with enhanced formatting
                         const lines = stdout.split('\n').filter(line => line.trim());
                         let changeCount = 0;
+                        const pendingFiles = [];
+
+                        // Parse detailed format output
+                        let currentFile = null;
+                        let currentChange = null;
 
                         for (const line of lines) {
-                            if (line.includes('edit') || line.includes('Edit')) {
-                                outputChannel.appendLine(`✏️  EDIT    ${line.replace(/edit|Edit/i, '').trim()}`);
-                                changeCount++;
-                            } else if (line.includes('add') || line.includes('Add')) {
-                                outputChannel.appendLine(`➕ ADD     ${line.replace(/add|Add/i, '').trim()}`);
-                                changeCount++;
-                            } else if (line.includes('delete') || line.includes('Delete')) {
-                                outputChannel.appendLine(`🗑️  DELETE  ${line.replace(/delete|Delete/i, '').trim()}`);
-                                changeCount++;
-                            } else if (line.includes('rename') || line.includes('Rename')) {
-                                outputChannel.appendLine(`🔄 RENAME  ${line.replace(/rename|Rename/i, '').trim()}`);
-                                changeCount++;
-                            } else if (line.trim() && !line.includes('===')) {
-                                outputChannel.appendLine(`📄 ${line}`);
-                            }
-                        }
+                            const trimmedLine = line.trim();
 
-                        if (changeCount === 0) {
+                            // Check if this is a file path line (starts with $/ or full path)
+                            if (trimmedLine.startsWith('$/') || trimmedLine.match(/^[A-Z]:\\/)) {
+                                // Extract file path (remove changeset info if present)
+                                currentFile = trimmedLine.split(';')[0];
+                                currentChange = null; // Reset change type
+                            }
+                            // Check if this is a change type line
+                            else if (trimmedLine.startsWith('Change     :')) {
+                                currentChange = trimmedLine.replace('Change     :', '').trim();
+                            }
+                            // Check if this is a local item line (contains the actual local path)
+                            else if (trimmedLine.startsWith('Local item :') && currentFile && currentChange) {
+                                // Extract the local path
+                                const localPathMatch = trimmedLine.match(/Local item\s*:\s*(?:\[.*?\]\s*)?(.+)$/);
+                                if (localPathMatch) {
+                                    const localPath = localPathMatch[1].trim();
+
+                                    // Determine icon based on change type
+                                    let icon = '';
+                                    let changeType = currentChange.toUpperCase();
+
+                                    switch (changeType) {
+                                        case 'EDIT':
+                                            icon = '✏️';
+                                            break;
+                                        case 'ADD':
+                                            icon = '➕';
+                                            break;
+                                        case 'DELETE':
+                                            icon = '🗑️';
+                                            break;
+                                        case 'RENAME':
+                                            icon = '🔄';
+                                            break;
+                                        default:
+                                            icon = '📄';
+                                            break;
+                                    }
+
+                                    changeCount++;
+
+                                    // Store for later use
+                                    pendingFiles.push({ path: localPath, type: changeType, icon: icon });
+
+                                    // Create formatted output
+                                    const fileName = path.basename(localPath);
+                                    const relativeDisplayPath = path.relative(rootPath, localPath);
+
+                                    outputChannel.appendLine(`${icon} ${changeType.padEnd(8)} ${relativeDisplayPath}`);
+                                    outputChannel.appendLine(`   File: ${localPath}`);
+                                    outputChannel.appendLine('');
+                                }
+                            }
+                        } if (changeCount === 0) {
                             outputChannel.appendLine('✅ No pending changes found.');
                         } else {
+                            outputChannel.appendLine('📊 Summary: ' + changeCount + ' pending change(s)');
                             outputChannel.appendLine('');
-                            outputChannel.appendLine(`📊 Summary: ${changeCount} pending change(s)`);
+                            outputChannel.appendLine('💡 Use Command Palette (Ctrl+Shift+P) → "TFS: Show Pending Changes with Actions" for clickable diff links');
                             outputChannel.appendLine('');
                             outputChannel.appendLine('Legend: ✏️ Edit  ➕ Add  🗑️ Delete  🔄 Rename');
+
+                            // Store pending files for the interactive command
+                            global.tfsCheckoutPendingFiles = pendingFiles;
                         }
 
                         vscode.window.showInformationMessage(`Found ${changeCount} pending change(s)`);
                     }
+                    progressResolve();
+                    resolve();
+                });
+            });
+        });
+    });
+}
+
+async function showInteractivePendingChanges() {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        vscode.window.showErrorMessage('No workspace folder found');
+        return;
+    }
+
+    return new Promise((resolve) => {
+        const command = 'tf status /recursive /format:detailed';
+        const rootPath = workspaceFolder.uri.fsPath;
+
+        vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "TFS Pending Changes",
+            cancellable: false
+        }, (progress) => {
+            progress.report({ message: "Checking for pending changes..." });
+
+            return new Promise((progressResolve) => {
+                exec(command, { cwd: rootPath }, async (error, stdout, stderr) => {
+                    if (error) {
+                        if (stderr.includes('No pending changes') || stdout.includes('No pending changes')) {
+                            vscode.window.showInformationMessage('No pending changes found');
+                        } else {
+                            vscode.window.showErrorMessage('Failed to check pending changes: ' + error.message);
+                        }
+                        progressResolve();
+                        resolve();
+                        return;
+                    }                    // Parse the output to extract files
+                    const lines = stdout.split('\n').filter(line => line.trim());
+                    const pendingFiles = [];
+
+                    // Parse detailed format output
+                    let currentFile = null;
+                    let currentChange = null;
+
+                    for (const line of lines) {
+                        const trimmedLine = line.trim();
+
+                        // Check if this is a file path line (starts with $/ or full path)
+                        if (trimmedLine.startsWith('$/') || trimmedLine.match(/^[A-Z]:\\/)) {
+                            // Extract file path (remove changeset info if present)
+                            currentFile = trimmedLine.split(';')[0];
+                            currentChange = null; // Reset change type
+                        }
+                        // Check if this is a change type line
+                        else if (trimmedLine.startsWith('Change     :')) {
+                            currentChange = trimmedLine.replace('Change     :', '').trim();
+                        }
+                        // Check if this is a local item line (contains the actual local path)
+                        else if (trimmedLine.startsWith('Local item :') && currentFile && currentChange) {
+                            // Extract the local path
+                            const localPathMatch = trimmedLine.match(/Local item\s*:\s*(?:\[.*?\]\s*)?(.+)$/);
+                            if (localPathMatch) {
+                                const localPath = localPathMatch[1].trim();
+
+                                // Determine icon based on change type
+                                let icon = '';
+                                let changeType = currentChange.toUpperCase();
+
+                                switch (changeType) {
+                                    case 'EDIT':
+                                        icon = '✏️';
+                                        break;
+                                    case 'ADD':
+                                        icon = '➕';
+                                        break;
+                                    case 'DELETE':
+                                        icon = '🗑️';
+                                        break;
+                                    case 'RENAME':
+                                        icon = '🔄';
+                                        break;
+                                    default:
+                                        icon = '📄';
+                                        break;
+                                }
+
+
+                                pendingFiles.push({
+                                    path: localPath,
+                                    type: changeType,
+                                    icon: icon,
+                                    displayName: `${icon} ${changeType}: ${path.basename(localPath)}`
+                                });
+                            }
+                        }
+                    } console.log('Interactive TFS Status - Total pending files found:', pendingFiles.length);
+
+                    if (pendingFiles.length === 0) {
+                        vscode.window.showInformationMessage('No pending changes found');
+                        progressResolve();
+                        resolve();
+                        return;
+                    }                    // Show quick pick with file options
+                    const quickPickItems = pendingFiles.map(file => ({
+                        label: file.displayName,
+                        description: path.relative(rootPath, file.path),
+                        detail: `Click to view diff with TFS version`,
+                        filePath: file.path
+                    }));
+
+                    quickPickItems.unshift({
+                        label: '📋 Show All Pending Changes (Output Panel)',
+                        description: 'View detailed list in output panel',
+                        detail: 'Traditional view with all changes listed',
+                        filePath: null
+                    });
+
+                    vscode.window.showQuickPick(quickPickItems, {
+                        placeHolder: `Select a file to view diff (${pendingFiles.length} pending changes)`,
+                        canPickMany: false,
+                        ignoreFocusOut: true
+                    }).then(async (selected) => {
+                        if (selected) {
+                            if (selected.filePath) {
+                                // Show diff for selected file
+                                await showTfsChangeDetails(selected.filePath);
+                            } else {
+                                // Show all pending changes in output panel
+                                await showTfsPendingChanges();
+                            }
+                        }
+                    });
+
                     progressResolve();
                     resolve();
                 });
